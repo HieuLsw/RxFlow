@@ -28,7 +28,7 @@ protocol FlowCoordinatorDelegate: class {
 /// A FlowCoordinator handles the navigation inside a dedicated Flow
 /// It will listen for Steps emitted be the Flow's Stepper companion or
 /// the Steppers produced by the Flow.navigate(to:) function along the way
-class FlowCoordinator {
+class FlowCoordinator: HasDisposeBag {
 
     /// The Flow to be coordinated
     private let flow: Flow
@@ -40,8 +40,6 @@ class FlowCoordinator {
     /// The delegate allows the FlowCoordinator to communicate with the Coordinator
     /// in the case of a new Flow to coordinate or before and after a navigation action
     private weak var delegate: FlowCoordinatorDelegate!
-
-    internal let disposeBag = DisposeBag()
 
     /// Initialize a FlowCoordinator
     ///
@@ -55,6 +53,47 @@ class FlowCoordinator {
     ///
     /// - Parameter stepper: The Stepper that goes with the Flow. It will trigger some Steps at the Flow level
     func coordinate (listeningTo stepper: Stepper) {
+
+        self.steps
+            .do(onNext: { [unowned self] (step) in
+                // trigger the delegate before the navigation is done
+                self.delegate.willNavigate(to: self.flow, with: step)
+            })
+            .map { [unowned self] (step) -> (Step, [Flowable]) in
+                // do the navigation according to the Flow and the Step
+                // Retrieve the Flowables
+                return (step, self.flow.navigate(to: step))
+            }
+            .do(onNext: { (step, _) in
+                // trigger the delegate after the navigation is done
+                self.delegate.didNavigate(to: self.flow, with: step)
+            })
+            .flatMap { (arg) -> Observable<Flowable> in
+                // flatten the Observable<[Flowable]> into Observable<Flowable>
+                // we know which Flowables have been produced by this navigation action
+                // each one of these Flowables will lead to other navigation actions (for example, new Flows to handle and new Steppers to listen)
+                let (_, flowables) = arg
+                return Observable.from(flowables)
+            }.do(onNext: { [unowned self] (flowable) in
+                // if the Flowable's next presentable represents a Flow, it has to be processed at a higher level because
+                // the FlowCoordinator only knowns about the Flow it's in charge of.
+                // The FlowCoordinator will expose the new Flow through its delegate
+                if flowable.nextPresentable is Flow {
+                    self.delegate.navigateToAnotherFlow(withFlowable: flowable)
+                }
+            }).filter { (flowable) -> Bool in
+                // at that point, only the Flowables that handle a non Flow nextPresentable
+                // should be processed
+                return flowable.nextPresentable != nil
+                    && flowable.nextStepper != nil
+                    && !(flowable.nextPresentable is Flow)
+            }.map { (flowable) -> (Presentable, Stepper) in
+                return (flowable.nextPresentable!, flowable.nextStepper!)
+            }.flatMap { (arg0) -> Observable<Step> in
+                let (presentable, stepper) = arg0
+                return stepper.steps
+        }
+        
 
         // Steps can be emitted by the Stepper companion of the Flow or the Steppers in the Flowables fired by the Flow.navigate(to:) function
         self.steps.asObservable().subscribe(onNext: { [unowned self] (step) in
@@ -114,10 +153,9 @@ class FlowCoordinator {
 
 /// The only purpose of a Coordinator is to handle the navigation that is
 /// declared in the Flows of the application.
-final public class Coordinator {
+final public class Coordinator: HasDisposeBag {
 
     private var flowCoordinators = [FlowCoordinator]()
-    private let disposeBag = DisposeBag()
     internal let willNavigateSubject = PublishSubject<(String, String)>()
     internal let didNavigateSubject = PublishSubject<(String, String)>()
 
